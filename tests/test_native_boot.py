@@ -65,7 +65,7 @@ class NativeBootTests(unittest.TestCase):
 
     def test_exact_manifest_paths_and_inherited_bootstrap_cleanup(self):
         with TemporaryDirectory() as folder:
-            base = Path(folder)
+            base = Path(folder).resolve()
             app = base / 'app'
             app.mkdir()
             shadow, script = base / 'shadow.json', base / 'start.cjs'

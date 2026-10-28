@@ -22,4 +22,4 @@ CI 已配置 Windows/Python 3.13/Node 22，第三方 Actions 固定到完整提�
 
 QQ 实机仅验证 README 指定构建；WPS 页面结构可能变化。没有对真实活动执行测试提交，也没有证明每个实际表单的重复填写行为。提交与录取分别核对。
 
-尚未确定远程仓库名称和可见性；未创建仓库、推送代码或发布版本标签。建仓后建议启用私密漏洞报告、密钥扫描及分支保护。
+源码仓库为公开的 [QGYB/qq-activity-assistant](https://github.com/QGYB/qq-activity-assistant)。远程自动检查及发布结果以仓库 Actions 与 Releases 记录为准；许可、私密漏洞报告、密钥保护及主分支规则应在首次发布时核对。

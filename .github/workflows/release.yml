@@ -1,0 +1,36 @@
+name: Source release
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+permissions:
+  contents: read
+jobs:
+  verify:
+    uses: $/.github/workflows/windows.yml
+  publish:
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Archive verified source and publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tagName = $env:GITHUB_REF_NAME
+          if ($tagName -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') { throw 'Invalid version tag' }
+          $archiveName = "qq-activity-assistant-$tagName-source.zip"
+          git archive --format=zip --prefix=qq-activity-assistant/ --output=$archiveName HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
+          $digest = (Get-FileHash -LiteralPath $archiveName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $archiveName" | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
+          $releaseArgs = @('release', 'create', $tagName, $archiveName, 'SHA256SUMS.txt', '--verify-tag', '--title', "群活动助手 $tagName", '--notes-file', 'docs/RELEASE_NOTES.md')
+          if ($tagName.Contains('-')) { $releaseArgs += '--prerelease' }
+          gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release failed' }

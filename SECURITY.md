@@ -1,6 +1,6 @@
 # 安全报告
 
-优先使用 GitHub 仓库的 **Security → Report a vulnerability** 私密入口，维护者需在建仓后启用。如果入口不可用，请只提交不含复现细节或敏感信息的联系请求，等待私密渠道；不要公开可被利用的细节。
+请使用仓库的 [私密漏洞报告入口](https://github.com/QGYB/qq-activity-assistant/security/advisories/new)。如果入口暂不可用，请只提交不含复现细节或敏感信息的联系请求，等待私密渠道；不要公开可被利用的细节。
 
 提供受影响版本、Windows/QQ 版本、复现步骤、影响说明和虚构数据的示例。勿附真实群消息、档案、本机配置、浏览器资料或令牌。
 

@@ -1,5 +1,10 @@
 # 群活动助手
 
+[![Windows checks](https://github.com/QGYB/qq-activity-assistant/actions/workflows/windows.yml/badge.svg)](https://github.com/QGYB/qq-activity-assistant/actions/workflows/windows.yml)
+[![AGPLv3](https://img.shields.io/badge/license-AGPLv3-blue.svg)](LICENSE)
+
+[源码仓库](https://github.com/QGYB/qq-activity-assistant) · [版本下载](https://github.com/QGYB/qq-activity-assistant/releases) · [报告问题](https://github.com/QGYB/qq-activity-assistant/issues/new/choose)
+
 Windows 桌面工具：接收所选 QQ 群的志愿活动通知，提取活动地点、时间、报名窗口和奖励；用户选择活动及参与人后，在开放时间自动填写和提交 WPS 表单。
 
 使用 Python、Tkinter、SQLite、自写 QQ 接收适配器和 Playwright。群消息在本机解析，档案和浏览器登录状态保存在本机；新通知不会自动为所有人报名。
@@ -82,7 +87,9 @@ node --test receiver/contract.test.cjs
 
 浏览器和 Tk 测试需要 Windows 图形会话及系统 Edge。测试使用临时数据库、模拟组件和路由拦截的可控表单，不重启真实 QQ，不访问真实活动提交接口。Windows CI 执行同一组检查。QQ 实机仍需匹配版本及用户登录，模拟检查不代替实机验证。
 
-见 [架构与边界](docs/ARCHITECTURE.md)、[贡献说明](CONTRIBUTING.md)、[安全报告](SECURITY.md)。
+见 [架构与边界](docs/ARCHITECTURE.md)、[贡献说明](CONTRIBUTING.md)、[安全报告](SECURITY.md)、[版本记录](CHANGELOG.md)。
+
+发布 `vX.Y.Z` 标签会先运行 Windows 全套检查，通过后生成源码 ZIP、SHA-256 校验文件和 GitHub Release。该流程不构建或发布 EXE/DLL。维护者应在发标签前更新版本号、变更记录和 `docs/RELEASE_NOTES.md`。
 
 ## 可执行程序状态
 
