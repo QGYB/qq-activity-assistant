@@ -658,6 +658,18 @@ class ControlledBrowserTests(unittest.TestCase):
         self.assertEqual(jobs[0]["status"], "uncertain")
         self.assertEqual(len(submitted), 1)
 
+    def test_wps_confirmation_dialog_is_accepted_after_validation(self):
+        dialog = '''<script>
+        const finishSubmit=document.querySelector('#submit').onclick;
+        document.querySelector('#submit').onclick=()=>{
+          const modal=document.createElement('div'); modal.setAttribute('role','dialog');
+          modal.innerHTML='<h2>确定提交吗？</h2><button>确定</button>';
+          modal.querySelector('button').onclick=finishSubmit;document.body.append(modal);
+        };</script>'''
+        jobs, submitted, _ = self.run_worker(fixture_html()+dialog, count=1)
+        self.assertEqual(jobs[0]["status"], "success")
+        self.assertEqual(len(submitted), 1)
+
     def test_captcha_after_click_keeps_possible_submission_uncertain(self):
         jobs, submitted, _ = self.run_worker(fixture_html(confirmation="请完成验证码"), count=1)
         self.assertEqual(jobs[0]["status"], "uncertain")

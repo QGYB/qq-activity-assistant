@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # SPDX-FileCopyrightText: 2026 QGYB and contributors
-"""Conservative WPS UI executor. All Playwright objects live on the worker thread.
+"""Scheduled WPS executor with a prepared native client and a guarded UI fallback.
 
-Only a positive, visible confirmation counts as success. No request replay, captcha
-solving, encrypted endpoint assumptions, or retries after a possible submission.
+Success needs a server answer receipt or explicit visible confirmation. All
+Playwright objects stay on the owner thread; possible submissions never retry.
 """
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from .booking_log import BookingLog
+from .wps_direct import DirectSession, plan_answers
 
 
 def _normalized(value):
@@ -366,6 +369,8 @@ class BrowserWorker:
         self._mode_change_pending = threading.Event()
         self._thread = None
         self._context = None
+        self._prepared = {}
+        self._warm_attempted = set()
         self._playwright = None
         self._login_mode = False
         self._profile_lock = None
@@ -485,12 +490,13 @@ class BrowserWorker:
         if self._context is not None:
             self._context.close()
             self._context = None
+        self._prepared.clear()
         if self._playwright is None:
             from playwright.sync_api import sync_playwright
             self._playwright = sync_playwright().start()
         context = self._playwright.chromium.launch_persistent_context(
             str(self.data_dir / "edge-profile"), channel="msedge", headless=not headed,
-            locale="zh-CN", timezone_id="Asia/Shanghai", accept_downloads=False,
+            locale="zh-CN", timezone_id="Asia/Shanghai", accept_downloads=False, service_workers="block",
             timeout=25000, handle_sigint=False, handle_sigterm=False, handle_sighup=False,
         )
         context.set_default_timeout(7000)
@@ -558,6 +564,7 @@ class BrowserWorker:
                         self._execute_job(job["id"])
                 if self._stop.is_set() or self._login_mode or self._mode_change_pending.is_set():
                     continue
+                self._warm_next_job()
                 # Account status should not wait behind the public-form scans
                 # requested by a page refresh. Due bookings still run first.
                 with self._login_status_lock:
@@ -588,6 +595,7 @@ class BrowserWorker:
             except Exception:
                 pass
             self._context = self._playwright = None
+            self._prepared.clear()
             self._login_mode = False
             self._set_login_status("unknown", "WPS 执行器已停止，登录状态未确认")
             if self._profile_lock:
@@ -922,15 +930,194 @@ class BrowserWorker:
             if actual != answer:
                 raise _Attention("填写后的答案与档案不一致，停止提交")
 
+    @staticmethod
+    def _preparation_key(activity):
+        return tuple(json.dumps(activity.get(key), sort_keys=True, ensure_ascii=False)
+                     for key in ("form_url", "opens_at", "closes_at", "lifecycle", "issues"))
+
+    def _warm_next_job(self):
+        """Load one public form ahead of time; no profile or answer is read here."""
+        if self._login_mode or self._stop.is_set() or self._mode_change_pending.is_set():
+            return
+        page = None
+        try:
+            jobs = {job["id"]: job for job in self.store.jobs()}
+            for identifier, prepared in list(self._prepared.items()):
+                job = jobs.get(identifier)
+                activity = self.store.get_activity(job["activity_id"]) if job else None
+                if (not job or job["status"] != "queued" or not activity
+                        or self._preparation_key(activity) != prepared["key"]):
+                    prepared["page"].close()
+                    self._prepared.pop(identifier, None)
+            if self._prepared:
+                return
+            now = datetime.now(timezone.utc)
+            candidates = []
+            for job in jobs.values():
+                if job["status"] != "queued":
+                    continue
+                activity = self.store.get_activity(job["activity_id"])
+                if not activity or activity.get("issues") or activity.get("lifecycle") in {"cancelled", "paused", "postponed"}:
+                    continue
+                opening = _time(activity.get("opens_at"))
+                if opening and 3 <= (opening-now).total_seconds() <= 45:
+                    candidates.append((opening, job, activity))
+            for opening, job, activity in sorted(candidates, key=lambda item: (item[0], item[1]["created_at"])):
+                key = self._preparation_key(activity)
+                attempt = (job["id"], key)
+                if attempt in self._warm_attempted:
+                    continue
+                self._warm_attempted.add(attempt)
+                code = _form_code(activity)
+                location = urlsplit(activity.get("form_url") or "")
+                if not code or location.scheme != "https" or location.hostname != "f.wps.cn" or location.username or location.password:
+                    continue
+                trace = BookingLog(self.data_dir, job["id"], opening)
+                trace.event("preparation_started")
+                if self._context is None:
+                    self._open_context(headed=False)
+                page = self._context.new_page()
+                session = DirectSession(page, code)
+                session.install_guard()
+                budget = max(500, min(8000, int((opening-datetime.now(timezone.utc)).total_seconds()*1000)-1500))
+                deadline = time.monotonic()+budget/1000
+                page.goto(activity["form_url"], wait_until="domcontentloaded", timeout=budget)
+                remaining = int((deadline-time.monotonic())*1000)
+                if remaining <= 0:
+                    raise TimeoutError("Preparation deadline reached")
+                page.wait_for_function(_FORM_SNAPSHOT, timeout=remaining)
+                self._prepared[job["id"]] = {"key": key, "page": page, "session": session, "trace": trace}
+                trace.event("page_prepared", native_client=session.ready())
+                page = None
+                return
+        except Exception:
+            self._notify("提前加载未完成，报名到点后仍会按正常流程核对执行")
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+    def _direct_constraints(self, form, job, activity):
+        status = _settings_status(form["settings"], activity)
+        if status:
+            raise _Attention(status[1], status[0])
+        settings = form["settings"]
+        if settings.get("checkPhone") or settings.get("onePageOneQuestion") or settings.get("channel", {}).get("isOnlyChannelAccess"):
+            raise _Attention("表单使用验证、分页或限定渠道，需要人工处理")
+        limit, count = settings.get("fillLimit") or 0, form.get("count")
+        try:
+            if int(limit) and count is None:
+                raise _Attention("未能核对表单实时收集数量")
+            if int(limit) and int(count) >= int(limit):
+                raise _Attention("WPS 表单已达到收集上限", "full")
+        except (ValueError, TypeError):
+            raise _Attention("表单收集数量无效，需要人工核对")
+        self._enforce_account_once(job, activity, form)
+
+    @staticmethod
+    def _direct_result(result):
+        state, detail = result.get("state"), result.get("detail") or "WPS 接口结果需要人工核对"
+        code = result.get("code")
+        if state in {"attention", "uncertain"} and code in {13015, 13017, 13027}:
+            return "uncertain", "WPS 提示已有答卷或重复填写；请核对已有记录，禁止自动重试"
+        if state in {"attention", "uncertain"} and code == 10002:
+            return "login_required", "WPS 表单会话需要重新登录，未确认提交成功"
+        if state in {"attention", "uncertain"} and code == 13016:
+            return "full", "WPS 接口拒绝本次填写：表单收集数量已达上限"
+        if state in {"attention", "uncertain"} and code == 13012:
+            return "expired", "WPS 接口拒绝本次填写：表单已截止"
+        if state in {"attention", "uncertain"} and code in {13018, 13023}:
+            return "attention", "WPS 接口提示当前不在允许填写时间，未确认提交成功"
+        if state == "uncertain" and type(code) is int and code != 0:
+            # A business error is an explicit rejection; a transport error is not.
+            if re.search(r"已填写|重复|只能填写一次", detail):
+                return "uncertain", detail+"；请核对已有记录，禁止自动重试"
+            if re.search(r"验证码|验证|短信", detail):
+                return "attention", detail
+            if re.search(r"登录", detail):
+                return "login_required", detail
+            if re.search(r"上限|已满|名额", detail):
+                return "full", detail
+            if re.search(r"截止|结束收集", detail):
+                return "expired", detail
+            return "failed", f"WPS 拒绝本次答卷（错误码 {code}）：{detail}"
+        if state not in {"success", "uncertain", "attention", "login_required", "cancelled"}:
+            state = "uncertain"
+        return state, detail
+
+    def _accept_submit_confirmation(self, page):
+        dialogs = page.get_by_role("dialog").filter(has_text=re.compile("提交"))
+        visible = [dialogs.nth(i) for i in range(dialogs.count()) if dialogs.nth(i).is_visible()]
+        if not visible:
+            return False
+        if len(visible) != 1:
+            raise _Attention("存在多个提交确认框，需要人工核对", "uncertain")
+        dialog = visible[0]
+        text = dialog.inner_text()
+        if re.search(r"验证码|短信|人脸|支付|授权|登录", text):
+            raise _Attention("提交确认涉及验证或授权，请人工处理", "uncertain")
+        button = dialog.get_by_role("button", name=re.compile(r"^\s*(?:确定(?:提交)?|确认(?:提交)?|提\s*交)\s*$"))
+        if button.count() != 1 or not button.is_enabled():
+            raise _Attention("未能唯一识别提交确认按钮", "uncertain")
+        button.click(timeout=3000)
+        return True
+
     def _execute_job(self, job_id):
-        page, clicked = None, False
+        page, clicked, session = None, False, None
+        trace = BookingLog(self.data_dir, job_id)
         try:
             job, activity, profile = self._load_job(job_id)
+            prepared = self._prepared.pop(job_id, None)
+            if prepared and prepared["key"] == self._preparation_key(activity) and not prepared["page"].is_closed():
+                page, session, trace = prepared["page"], prepared["session"], prepared["trace"]
+            elif prepared:
+                prepared["page"].close()
+            trace.opening = _time(activity["opens_at"])
+            trace.event("execution_started", prepared=page is not None)
             if self._context is None:
                 self._open_context(headed=False)
-            page = self._context.new_page()  # Every person starts with a fresh document.
-            page.goto(activity["form_url"], wait_until="domcontentloaded")
-            page.wait_for_function("() => document.querySelector('.ksapc-questions-write-container') || /需要登录|暂停收集|达到上限/.test(document.body.innerText)", timeout=18000)
+            if page is None:
+                page = self._context.new_page()  # Every person owns an independent document.
+                session = DirectSession(page, _form_code(activity))
+                session.install_guard()
+                page.goto(activity["form_url"], wait_until="domcontentloaded")
+                page.wait_for_function(
+                    f"() => ({_FORM_SNAPSHOT})() || /需要登录|暂停收集|达到上限|已达上限/.test(document.body.innerText)",
+                    timeout=18000)
+            def authorize():
+                if self._stop.is_set() or self._login_mode or self._mode_change_pending.is_set():
+                    return False
+                _, current_activity, current_profile = self._load_job(job_id)
+                return current_activity == activity and current_profile == profile
+            session.authorize = authorize
+            session.on_send = lambda: trace.event("request_sent")
+            if session.ready():
+                trace.event("native_client_ready")
+                form = session.refresh()
+                self._direct_constraints(form, job, activity)
+                try:
+                    answers = plan_answers(form, profile, match_field, choose_option)
+                except ValueError as exc:
+                    raise _Attention(str(exc)) from exc
+                staged = session.stage(answers)
+                if staged.get("state") != "ready":
+                    state, detail = self._direct_result(staged)
+                    raise _Attention(detail, state)
+                trace.event("answers_validated")
+                if not authorize():
+                    raise _Attention("活动、人员或执行状态发生变化，未发送答卷", "cancelled")
+                result = session.submit()
+                state, detail = self._direct_result(result)
+                if state == "login_required":
+                    self._set_login_status("offline", detail, checked=True)
+                if result.get("receipt"):
+                    trace.event("server_receipt", **result["receipt"])
+                self.store.update_job(job_id, state, detail)
+                self._notify(detail)
+                return
+            trace.event("ui_fallback")
             # Let React finish reconciling defaults before inventory and filling.
             page.wait_for_timeout(500)
             form, questions = self._inspect(page, activity)
@@ -951,8 +1138,10 @@ class BrowserWorker:
                 raise _Attention("提交按钮不可用或不唯一，未提交")
             # Set before invoking click: a click timeout can occur after the server received it.
             clicked = True
+            trace.event("submit_clicked")
             submit.click(timeout=7000)
             deadline = time.monotonic()+12
+            confirmed = False
             while time.monotonic() < deadline:
                 status = self._visible_status(page, after_click=True)
                 if status:
@@ -964,18 +1153,30 @@ class BrowserWorker:
                     return
                 if self._stop.is_set():
                     break
+                if not confirmed and not session.sent:
+                    if not authorize():
+                        raise _Attention("提交确认前任务状态已变更，停止处理", "uncertain")
+                    confirmed = self._accept_submit_confirmation(page)
+                    if confirmed:
+                        trace.event("confirmation_accepted")
                 page.wait_for_timeout(300)
             raise _Attention("已点击提交但无法确认 WPS 服务端结果，请人工核实；禁止自动重试", "uncertain")
         except _Attention as exc:
             self.store.update_job(job_id, exc.status, exc.detail)
             self._notify(exc.detail)
         except Exception:
-            status = "uncertain" if clicked else "failed"
-            detail = ("提交动作后浏览器或网络中断，结果待核实；禁止自动重试" if clicked else
+            possible_submission = clicked or bool(session and session.sent)
+            status = "uncertain" if possible_submission else "failed"
+            detail = ("提交动作后浏览器或网络中断，结果待核实；禁止自动重试" if possible_submission else
                       "提交前浏览器或网络失败，未自动重试；请检查 Edge、网络和表单页面")
             self.store.update_job(job_id, status, detail)
             self._notify(detail)
         finally:
+            final = self.store.get_job(job_id)
+            if final:
+                if final["status"] != "success":
+                    trace.capture(page)
+                trace.event("result", status=final["status"], detail=final.get("detail", ""))
             if page is not None:
                 try:
                     page.close()
